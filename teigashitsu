@@ -1,0 +1,193 @@
+import os
+import re
+import argparse
+import numpy as np
+import subprocess
+from PIL import Image, ImageSequence
+from sklearn.cluster import KMeans
+
+class TeigashitsuGenerator:
+    def __init__(self, inputpath, outputpath, pixelsize=None, total_color=None):
+        self.inputpath = inputpath
+        self.outputpath = outputpath
+        self.pixelsize = pixelsize
+        self.total_color = total_color
+        self.base_img = None
+        self.feature_rgb = None
+        self.org_shape = None
+        self.height = None
+        self.width = None
+        self.frames = None
+        self.duration = None
+
+    def run(self):
+        self.read_image()
+        if self.frames is not None:
+            filenum = 0
+            frames = []
+            for frame in self.frames:
+                filename = '{0:06d}.gif'.format(filenum)
+                self.base_img = frame
+                self.resize()
+                self.define_pixelsize()
+                self.to_mosaic()
+                self.run_kmeans()
+                self.render(filename)
+                frames.append(filename)
+                filenum += 1
+            if self.outputpath is not None:
+                outputpath = self.outputpath
+            else:
+                outputpath = './output.gif'
+            subprocess.call("convert -delay {} -loop 0 -coalesce ./0*.gif ./output.gif".format(self.duration), shell=True)
+            [self.delete_image(f) for f in frames]
+        else:
+            self.resize()
+            self.define_pixelsize()
+            self.to_mosaic()
+            self.run_kmeans()
+            self.render()
+
+    # 画像読み込み
+    def read_image(self):
+        filepath = self.inputpath
+        im = Image.open(filepath)
+        if "duration" in im.info: # gifアニメ対応
+            self.duration = round(im.info["duration"]) / 10
+            frames = [frame.copy() for frame in ImageSequence.Iterator(im)]
+            self.frames = [frame.convert('RGBA') for frame in frames]
+        else:
+            self.base_img = Image.open(filepath)
+
+    # 不要なファイルの削除
+    def delete_image(self , f):
+        os.remove(f)
+
+    # 300x300以内に納まるようにリサイズ処理
+    def resize(self):
+        np_img = np.array(self.base_img)
+        height, width = np_img.shape[:2]
+        self.height, self.width = self.__new_size(height, width)
+        self.base_img = self.base_img.resize((self.width, self.height))
+        np_img = np.array(self.base_img)
+        self.org_shape = np_img.shape
+        print("Shape: {}".format(self.org_shape))
+        print("Original Size: {}x{}".format(width, height))
+        print("Resized Size: {}x{}".format(self.width, self.height))
+
+    # 分割するpixel size=ドットのサイズを決める
+    def define_pixelsize(self):
+        if self.pixelsize is None:
+            x = (self.height * self.width) / 19031.0
+            if x < 2:
+                # 19031ピクセル以下の場合は大抵小さい画像なので3x3くらいのフィルタで大きめのdotで対応
+                self.pixelsize = 3
+            else:
+                self.pixelsize = int(x)
+        print("PixelSize: {}".format(self.pixelsize))
+
+    # 画像をモザイク分割。透過にも対応
+    def to_mosaic(self):
+        self.base_img = np.array(self.base_img)
+        _pixelsize = self.pixelsize
+        dh = round(self.height / _pixelsize)
+        dw = round(self.width / _pixelsize)
+        row_step = 0
+        col_step = 0
+        feature_rgb = np.empty((0, 3), float)
+        alpha = self.base_img.shape[2]
+        if alpha == 4:
+            feature_rgb = np.empty((0, 4), float)
+        for i in range(dh):
+            for j in range(dw):
+                cell = self.base_img[row_step:row_step+_pixelsize, col_step:col_step+_pixelsize]
+                mean_rgb = cell.mean(axis=(0, 1))
+                self.base_img[row_step:row_step+_pixelsize, col_step:col_step+_pixelsize] = mean_rgb
+                feature_rgb = np.append(feature_rgb, np.array([mean_rgb]), axis=0)
+                col_step += _pixelsize
+            col_step = 0
+            row_step += _pixelsize
+        self.feature_rgb = feature_rgb
+
+    # kmeans++でクラスタリング
+    # Max設けたほうがいいかも
+    def run_kmeans(self):
+        if self.total_color is None:
+            K = int(self.__total_color(self.base_img) / 400)
+        else:
+            K = self.total_color
+        print("Colors: {}".format(K))
+        _feature_rgb = self.feature_rgb
+        clf = KMeans(n_clusters=K)
+        clf.fit(_feature_rgb)
+        cluster_id = clf.predict(_feature_rgb) # (16384,)
+        for k_id in range(K):
+            # クラスタIDごとにrgb要素を平均色に変える
+            # cluster_id == k_id => [True, False, False, True]
+            print(_feature_rgb[cluster_id == k_id].mean(0))
+            _feature_rgb[cluster_id == k_id] = _feature_rgb[cluster_id == k_id].mean(0)
+        self.feature_rgb = _feature_rgb
+
+    # 元画像に平均色を適用する
+    def render(self, filename=None):
+        idx = 0
+        row_step = 0
+        col_step = 0
+        _pixelsize = self.pixelsize
+        dh = round(self.height / _pixelsize)
+        dw = round(self.width / _pixelsize)
+        for i in range(dh):
+            for j in range(dw):
+                self.base_img[row_step:row_step+_pixelsize, col_step:col_step+_pixelsize] = self.feature_rgb[idx]
+                col_step += _pixelsize
+                idx += 1
+            col_step = 0
+            row_step += _pixelsize
+        converted_img = self.base_img.astype(np.uint8).reshape(self.org_shape)
+        converted_img = Image.fromarray(converted_img)
+        if filename is not None:
+            converted_img.save(filename)
+            return converted_img
+        else:
+            if self.outputpath is not None:
+                converted_img.save(self.outputpath)
+            else:
+                converted_img.save('./output.png')
+
+    def __file_extension(self, filename):
+        filepath, ext = os.path.splitext(filename)
+        return ext
+
+    def __new_size(self, height, width):
+        threshold = 400
+        if height < threshold and width < threshold:
+            return (height, width)
+        elif height > width:
+            res_h = threshold
+            res_w = round(threshold * (width/height))
+            return (res_h, res_w)
+        else:
+            res_h = round(threshold * (height/width))
+            res_w = threshold
+            return (res_h, res_w)
+
+    def __total_color(self, img):
+        img = img[:,:,:3]
+        colors = img.reshape(self.width*self.height, 3)
+        a = np.ascontiguousarray(colors)
+        uniq_a = np.unique(a.view([('', a.dtype)]*a.shape[1]))
+        total_color = len(uniq_a.view(a.dtype).reshape((uniq_a.shape[0], a.shape[1])))
+        print("Total Color: {}".format(total_color))
+        return total_color
+
+
+if __name__ == '__main__':
+    parser = argparse.ArgumentParser(description='Pixel Art Generator')
+    parser.add_argument('--input', '-i', type=str, help='Input file path')
+    parser.add_argument('--output', '-o', type=str, help='Output file path')
+    parser.add_argument('--pixelsize', '-s', type=int, help='Input pixel size')
+    parser.add_argument('--totalcolor', '-c', type=int, help='Input total color')
+    args = parser.parse_args()
+
+    teigashitsu_generator = TeigashitsuGenerator(args.input, args.output, args.pixelsize, args.totalcolor)
+    teigashitsu_generator.run()
